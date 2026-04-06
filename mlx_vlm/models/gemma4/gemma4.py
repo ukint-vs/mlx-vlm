@@ -20,18 +20,22 @@ def masked_scatter(input_tensor, mask, source):
 
 
 class MultimodalEmbedder(nn.Module):
-    """Projects soft tokens from vision/audio into language model space."""
+    """Projects soft tokens from vision/audio into language model space.
+
+    Uses post-projection norm (matches HF reference), not pre-projection
+    as in upstream mlx-vlm.
+    """
 
     def __init__(self, embedding_dim: int, text_hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.embedding_projection = nn.Linear(
             embedding_dim, text_hidden_size, bias=False
         )
-        self.embedding_pre_projection_norm = RMSNormNoScale(embedding_dim, eps=eps)
+        self.embedding_post_projection_norm = RMSNormNoScale(text_hidden_size, eps=eps)
 
     def __call__(self, inputs_embeds: mx.array) -> mx.array:
-        normed = self.embedding_pre_projection_norm(inputs_embeds)
-        return self.embedding_projection(normed)
+        proj = self.embedding_projection(inputs_embeds)
+        return self.embedding_post_projection_norm(proj)
 
 
 class Model(nn.Module):
@@ -82,6 +86,8 @@ class Model(nn.Module):
         if input_features_mask is not None and audio_mask is None:
             audio_mask = ~input_features_mask.astype(mx.bool_)
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        # ScaledEmbedding already applies scaling internally;
+        # embed_scale is 1.0 so this is a no-op, kept for upstream compat.
         inputs_embeds = inputs_embeds * self.language_model.model.embed_scale
 
         per_layer_inputs = None

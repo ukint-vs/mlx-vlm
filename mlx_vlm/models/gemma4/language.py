@@ -352,16 +352,33 @@ class DecoderLayer(nn.Module):
         return h
 
 
-class ScaledLinear(nn.Module):
-    """Linear layer with output scaling."""
+class ScaledEmbedding(nn.Embedding):
+    """Embedding with output scaling by sqrt(hidden_size).
+
+    Encapsulates scaling to prevent double-scaling when gemma4.py also
+    multiplies by embed_scale (which we set to 1.0).
+    """
+
+    def __init__(self, num_embeddings: int, dims: int, embed_scale: float = 1.0):
+        super().__init__(num_embeddings, dims)
+        self.embed_scale = embed_scale
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return super().__call__(x) * self.embed_scale
+
+    def as_linear(self, x: mx.array) -> mx.array:
+        return x @ self.weight.T
+
+
+class ScaledLinear(nn.Linear):
+    """Linear layer with output scaling (quantization-compatible)."""
 
     def __init__(self, in_features: int, out_features: int, scalar: float):
-        super().__init__()
-        self.weight = mx.zeros((out_features, in_features))
+        super().__init__(in_features, out_features, bias=False)
         self.scalar = scalar
 
     def __call__(self, x: mx.array) -> mx.array:
-        return (x @ self.weight.T) * self.scalar
+        return super().__call__(x) * self.scalar
 
 
 class Gemma4TextModel(nn.Module):
@@ -373,8 +390,14 @@ class Gemma4TextModel(nn.Module):
         self.sliding_window_pattern = config.sliding_window_pattern
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.embed_scale = config.hidden_size**0.5
+        # gemma4.py multiplies embed_tokens output by embed_scale,
+        # but ScaledEmbedding already applies the scaling internally.
+        # Set to 1.0 to avoid double-scaling.
+        self.embed_scale = 1.0
+
+        self.embed_tokens = ScaledEmbedding(
+            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
+        )
         self.layers = [
             DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
         ]
@@ -412,11 +435,11 @@ class Gemma4TextModel(nn.Module):
         # Per-layer input embeddings (2B/4B models)
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.embed_tokens_per_layer = nn.Embedding(
+            self.embed_tokens_per_layer = ScaledEmbedding(
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
+                embed_scale=config.hidden_size_per_layer_input**0.5,
             )
-            self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection = ScaledLinear(
                 config.hidden_size,
@@ -433,9 +456,7 @@ class Gemma4TextModel(nn.Module):
             self.per_layer_projection_norm = None
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
-        result = self.embed_tokens_per_layer(input_ids)
-        result = result * self.embed_tokens_per_layer_scale
-        return result.reshape(
+        return self.embed_tokens_per_layer(input_ids).reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
@@ -470,9 +491,7 @@ class Gemma4TextModel(nn.Module):
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
-            h = h * self.embed_scale
         else:
-
             h = inputs_embeds
 
         if self.hidden_size_per_layer_input:
